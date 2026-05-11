@@ -7,6 +7,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
+from methods.evaluate import to_percent_table
 
 import numpy as np
 import pandas as pd
@@ -15,22 +16,23 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from oscp.relational import (
+from methods.relational_core import (
     RelationSpec,
     RelationalSelectionConfig,
-    action_wise_cp,
     aggregate_runs,
     compute_support_scores,
     evaluate_edge_sets,
+    select_top_edges,
+)
+from methods.baselines import (
+    action_wise_cp,
     relational_bonferroni_cp,
     relational_jomi_unit_top,
     relational_marginal_cp,
-    relational_oscp_top,
     relational_self_calibrating_cp,
-    relational_swap_cp,
-    select_top_edges,
 )
-from oscp.synthetic import (
+from methods.oscp import relational_oscp_top, relational_swap_cp
+from methods.synthetic import (
     CRITICAL_CLASS,
     LABELS,
     fit_base_classifier,
@@ -188,19 +190,6 @@ def run_one(
     return pd.DataFrame(rows), diagnostics
 
 
-def to_percent_table(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    percent_cols = [
-        c
-        for c in out.columns
-        if c.endswith("_cov")
-        or c.endswith("_explain")
-        or c.endswith("_miss_rate")
-        or c in {"coverage", "edge_cov", "explain_rate"}
-    ]
-    for c in percent_cols:
-        out[c] = 100.0 * out[c]
-    return out
 
 
 def round_for_output(df: pd.DataFrame) -> pd.DataFrame:
@@ -262,7 +251,7 @@ def main() -> None:
                 [
                     "method",
                     "coverage",
-                    "size",
+                    "avg_size",
                     "time_sec",
                     "decision_ambiguity",
                     "action_union_size",
@@ -272,7 +261,7 @@ def main() -> None:
                     "imaging_cov",
                     "urgent_cov",
                     "expert_review_cov",
-                    "avg_size",
+                    "edge_size",
                     "action_cov_gap",
                     "worst_under_gap",
                     "explain_rate",
@@ -294,12 +283,12 @@ def main() -> None:
     core_cols = [
         "method",
         "coverage",
-        "size",
+        "avg_size",
         "time_sec",
         "decision_ambiguity",
         "action_union_size",
         "edge_cov",
-        "avg_size",
+        "edge_size",
         "avg_ref_size",
         "routine_cov",
         "labs_cov",
@@ -312,7 +301,7 @@ def main() -> None:
     display_cols = [
         "method",
         "coverage",
-        "size",
+        "avg_size",
         "time_sec",
         "decision_ambiguity",
         "action_union_size",
@@ -322,7 +311,7 @@ def main() -> None:
         "imaging_cov",
         "urgent_cov",
         "expert_review_cov",
-        "avg_size",
+        "edge_size",
         "action_cov_gap",
         "worst_under_gap",
         "explain_rate",
