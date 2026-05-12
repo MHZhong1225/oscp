@@ -13,8 +13,6 @@ import pandas as pd
 
 import torch
 import torch.nn.functional as F
-
-
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -160,6 +158,7 @@ def _build_preprocess(
     max_text_features: int = 1000,
     min_frequency: int = 20,
 ) -> ColumnTransformer:
+    """Build preprocessing for ED tabular and text features."""
     numeric_cols = x_train.select_dtypes(include=[np.number]).columns.tolist()
     text_cols = ["chiefcomplaint"]
     categorical_cols = [
@@ -227,7 +226,8 @@ def _fit_torch_linear_classifier(
     x_train_np = _to_dense(x_train)
     x_val_np = _to_dense(x_val)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if device.startswith("cuda"):
+        torch.cuda.manual_seed_all(seed)
     torch_device = torch.device(device)
     x_train_tensor = torch.as_tensor(x_train_np, dtype=torch.float32, device=torch_device)
     y_train_tensor = torch.as_tensor(y_train, dtype=torch.long, device=torch_device)
@@ -239,9 +239,9 @@ def _fit_torch_linear_classifier(
 
     best_state = None
     best_val_loss = float("inf")
-    patience = 40
+    patience = 25
     stale_epochs = 0
-    for _ in range(400):
+    for _ in range(250):
         linear.train()
         optimizer.zero_grad()
         train_loss = F.cross_entropy(linear(x_train_tensor), y_train_tensor)
@@ -696,9 +696,9 @@ def load_mimic_ed_acquisition(
 ) -> MimicEDData:
     """Load ED-stay diagnostic-acquisition data.
 
-    Features are limited to demographics, arrival metadata, triage vitals, chief
-    complaint, and prior-utilization proxies. Action labels use events in
-    [ED intime, ED intime + action_window_hours).
+    The feature set is limited to demographics, arrival metadata, triage
+    vitals, chief complaint, and prior-utilization proxies. Action labels use
+    events in [ED intime, ED intime + action_window_hours).
     """
     full_df = _load_or_build_cached_ed_frame(
         ed_root=ed_root,
@@ -750,7 +750,13 @@ def _stratify_labels_or_none(labels: np.ndarray) -> np.ndarray | None:
 def make_mimic_ed_splits(data: MimicEDData, seed: int = 0) -> MimicEDSplitData:
     """Create patient-level 50/15/15/20 train/val/cal/test splits."""
     subjects = np.unique(data.subject_id)
-    subject_labels = pd.Series(data.y).groupby(data.subject_id).max().loc[subjects].to_numpy()
+    subject_labels = (
+        pd.Series(data.y)
+        .groupby(data.subject_id)
+        .max()
+        .loc[subjects]
+        .to_numpy()
+    )
 
     train_subjects, rest_subjects, _, rest_labels = train_test_split(
         subjects,
@@ -802,7 +808,7 @@ def make_mimic_ed_splits(data: MimicEDData, seed: int = 0) -> MimicEDSplitData:
 def _fit_sklearn_mimic_ed_models(
     split: MimicEDSplitData,
     seed: int = 0,
-    max_text_features: int = 1000,
+    max_text_features: int = 500,
     min_frequency: int = 20,
 ) -> tuple[MimicEDOutcomeClassifier, MimicEDActionSupportModel, dict[str, Any]]:
     """Fit p(Y | x_obs) and one calibrated g_a(x_obs) model per action."""
@@ -816,7 +822,7 @@ def _fit_sklearn_mimic_ed_models(
 
     outcome_base = LogisticRegression(
         C=1.0,
-        max_iter=1000,
+        max_iter=500,
         class_weight="balanced",
         random_state=seed,
     )
@@ -831,12 +837,17 @@ def _fit_sklearn_mimic_ed_models(
     for a, action_name in enumerate(MIMIC_ED_ACTIONS):
         y_action = split.actions_train[:, a]
         y_action_val = split.actions_val[:, a]
-        if np.unique(y_action).size < 2:
+        is_constant = np.unique(y_action).size < 2
+        if is_constant:
             clf: Any = ConstantBinaryClassifier(float(np.mean(y_action)))
+            probs = np.clip(clf.predict_proba(x_val)[:, -1], 1e-6, 1.0 - 1e-6)
+            action_val_loss = float(
+                log_loss(y_action_val, np.column_stack([1.0 - probs, probs]), labels=[0, 1])
+            )
         else:
             base = LogisticRegression(
                 C=1.0,
-                max_iter=1000,
+                max_iter=500,
                 class_weight="balanced",
                 random_state=seed + 100 + a,
             )
@@ -845,11 +856,16 @@ def _fit_sklearn_mimic_ed_models(
                 clf = _calibrate_prefit(base, x_val, y_action_val)
             else:
                 clf = base
+            probs = np.clip(clf.predict_proba(x_val)[:, -1], 1e-6, 1.0 - 1e-6)
+            action_val_loss = float(
+                log_loss(
+                    y_action_val,
+                    np.column_stack([1.0 - probs, probs]),
+                    labels=[0, 1],
+                )
+            )
         action_classifiers.append(clf)
-        probs = np.clip(clf.predict_proba(x_val)[:, -1], 1e-6, 1.0 - 1e-6)
-        action_val_losses[f"{action_name}_val_log_loss"] = float(
-            log_loss(y_action_val, np.column_stack([1.0 - probs, probs]), labels=[0, 1])
-        )
+        action_val_losses[f"{action_name}_val_log_loss"] = action_val_loss
 
     outcome_model = MimicEDOutcomeClassifier(
         preprocess=preprocess,
@@ -878,7 +894,7 @@ def _fit_sklearn_mimic_ed_models(
 def _fit_torch_mimic_ed_models(
     split: MimicEDSplitData,
     seed: int = 0,
-    max_text_features: int = 1000,
+    max_text_features: int = 500,
     min_frequency: int = 20,
     device: str = "cuda:0",
 ) -> tuple[MimicEDOutcomeClassifier, MimicEDActionSupportModel, dict[str, Any]]:
@@ -905,8 +921,13 @@ def _fit_torch_mimic_ed_models(
     for a, action_name in enumerate(MIMIC_ED_ACTIONS):
         y_action = split.actions_train[:, a]
         y_action_val = split.actions_val[:, a]
-        if np.unique(y_action).size < 2:
+        is_constant = np.unique(y_action).size < 2
+        if is_constant:
             clf: Any = ConstantBinaryClassifier(float(np.mean(y_action)))
+            probs = np.clip(clf.predict_proba(x_val)[:, -1], 1e-6, 1.0 - 1e-6)
+            action_val_loss = float(
+                log_loss(y_action_val, np.column_stack([1.0 - probs, probs]), labels=[0, 1])
+            )
         else:
             clf, action_val_loss = _fit_torch_linear_classifier(
                 x_train=x_train,
@@ -917,13 +938,8 @@ def _fit_torch_mimic_ed_models(
                 seed=seed + 100 + a,
                 device=device,
             )
-            action_val_losses[f"{action_name}_val_log_loss"] = action_val_loss
-        if np.unique(y_action).size < 2:
-            probs = np.clip(clf.predict_proba(x_val)[:, -1], 1e-6, 1.0 - 1e-6)
-            action_val_losses[f"{action_name}_val_log_loss"] = float(
-                log_loss(y_action_val, np.column_stack([1.0 - probs, probs]), labels=[0, 1])
-            )
         action_classifiers.append(clf)
+        action_val_losses[f"{action_name}_val_log_loss"] = action_val_loss
 
     outcome_model = MimicEDOutcomeClassifier(
         preprocess=preprocess,
@@ -949,11 +965,14 @@ def _fit_torch_mimic_ed_models(
 def fit_mimic_ed_models(
     split: MimicEDSplitData,
     seed: int = 0,
-    max_text_features: int = 1000,
+    max_text_features: int = 500,
     min_frequency: int = 20,
     cuda: int | None = None,
 ) -> tuple[MimicEDOutcomeClassifier, MimicEDActionSupportModel, dict[str, Any]]:
-    device = "cpu" if cuda is None else f"cuda:{cuda}"
+    use_cuda = (
+        cuda is not None and cuda >= 0 and torch is not None and torch.cuda.is_available()
+    )
+    device = f"cuda:{cuda}" if use_cuda else "cpu"
     if device == "cpu":
         return _fit_sklearn_mimic_ed_models(
             split,

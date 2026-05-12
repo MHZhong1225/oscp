@@ -71,24 +71,6 @@ def existing_cols(df: pd.DataFrame, cols: Sequence[str]) -> list[str]:
     return [c for c in cols if c in df.columns]
 
 
-def _ordered_arrays(
-    batch_mode: str,
-    seed: int,
-    probs: np.ndarray,
-    support: np.ndarray,
-    labels: np.ndarray,
-    actions: np.ndarray,
-    intime: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    if batch_mode == "arrival":
-        order = np.argsort(intime, kind="mergesort")
-    elif batch_mode == "random":
-        order = np.random.default_rng(seed).permutation(labels.size)
-    else:
-        raise ValueError(f"unknown batch_mode: {batch_mode}")
-    return probs[order], support[order], labels[order], actions[order]
-
-
 def run_one(
     seed: int,
     n: int | None,
@@ -136,24 +118,22 @@ def run_one(
     cal_support = support_model.predict_support(split.x_cal)
     test_support = support_model.predict_support(split.x_test)
 
-    cal_probs, cal_support, cal_labels, _ = _ordered_arrays(
-        batch_mode=batch_mode,
-        seed=seed + 1000,
-        probs=cal_probs,
-        support=cal_support,
-        labels=split.y_cal,
-        actions=split.actions_cal,
-        intime=split.intime_cal,
-    )
-    test_probs, test_support, test_labels, test_actions = _ordered_arrays(
-        batch_mode=batch_mode,
-        seed=seed + 2000,
-        probs=test_probs,
-        support=test_support,
-        labels=split.y_test,
-        actions=split.actions_test,
-        intime=split.intime_test,
-    )
+    if batch_mode == "arrival":
+        cal_order = np.argsort(split.intime_cal, kind="mergesort")
+        test_order = np.argsort(split.intime_test, kind="mergesort")
+    elif batch_mode == "random":
+        cal_order = np.random.default_rng(seed + 1000).permutation(split.y_cal.size)
+        test_order = np.random.default_rng(seed + 2000).permutation(split.y_test.size)
+    else:
+        raise ValueError(f"unknown batch_mode: {batch_mode}")
+
+    cal_probs = cal_probs[cal_order]
+    cal_support = cal_support[cal_order]
+    cal_labels = split.y_cal[cal_order]
+    test_probs = test_probs[test_order]
+    test_support = test_support[test_order]
+    test_labels = split.y_test[test_order]
+    test_actions = split.actions_test[test_order]
 
     selection = select_top_edges(test_support, config)
     if selection.n_edges == 0:
@@ -163,13 +143,7 @@ def run_one(
     edge_difficulty = edge_selection_thresholds(test_support, selection, config)
 
     timed_results = []
-
-    def add_timed_result(make_result):
-        start = time.perf_counter()
-        result = make_result()
-        timed_results.append((result, time.perf_counter() - start))
-
-    add_timed_result(
+    timed_calls = [
         lambda: marginal_edge_cp(
             cal_probs=cal_probs,
             cal_labels=cal_labels,
@@ -177,9 +151,7 @@ def run_one(
             selection=selection,
             alpha=alpha,
             score=score,
-        )
-    )
-    add_timed_result(
+        ),
         lambda: actionwise_selected_cp(
             cal_probs=cal_probs,
             cal_labels=cal_labels,
@@ -189,9 +161,7 @@ def run_one(
             config=config,
             alpha=alpha,
             score=score,
-        )
-    )
-    add_timed_result(
+        ),
         lambda: relational_oscp_top(
             cal_probs=cal_probs,
             cal_labels=cal_labels,
@@ -203,8 +173,12 @@ def run_one(
             alpha=alpha,
             score=score,
             method="OSCP",
-        )
-    )
+        ),
+    ]
+
+    for make_result in timed_calls:
+        start = time.perf_counter()
+        timed_results.append((make_result(), time.perf_counter() - start))
 
     rows = []
     for result, time_sec in timed_results:
@@ -298,7 +272,7 @@ def main() -> None:
     )
     parser.add_argument("--action-window-hours", type=float, default=6.0)
     parser.add_argument("--chunksize", type=int, default=2_000_000)
-    parser.add_argument("--max-text-features", type=int, default=1000)
+    parser.add_argument("--max-text-features", type=int, default=500)
     parser.add_argument("--min-frequency", type=int, default=20)
     parser.add_argument("--cuda", type=int, default=0, help="CUDA device index, defaults to 0.")
     parser.add_argument("--verbose", action="store_true", help="Print per-seed diagnostics and tables.")

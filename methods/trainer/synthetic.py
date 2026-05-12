@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+
 try:
     import torch
     import torch.nn.functional as F
@@ -136,7 +137,7 @@ def _fit_sklearn_classifier(split: SplitData, seed: int = 0):
         StandardScaler(),
         LogisticRegression(
             C=2.0,
-            max_iter=2000,
+            max_iter=500,
             random_state=seed,
         ),
     )
@@ -171,9 +172,9 @@ def _fit_torch_classifier(split: SplitData, seed: int, device: str):
 
     best_state = None
     best_val_loss = float("inf")
-    patience = 40
+    patience = 25
     stale_epochs = 0
-    for _ in range(400):
+    for _ in range(250):
         linear.train()
         optimizer.zero_grad()
         train_loss = F.cross_entropy(linear(x_train), y_train)
@@ -219,7 +220,10 @@ def _fit_torch_classifier(split: SplitData, seed: int, device: str):
 
 
 def fit_base_classifier(split: SplitData, seed: int = 0, cuda: int | None = None):
-    device = "cpu" if cuda is None else f"cuda:{cuda}"
+    use_cuda = (
+        cuda is not None and cuda >= 0 and torch is not None and torch.cuda.is_available()
+    )
+    device = f"cuda:{cuda}" if use_cuda else "cpu"
     if device == "cpu":
         return _fit_sklearn_classifier(split, seed=seed)
     return _fit_torch_classifier(split, seed=seed, device=device)

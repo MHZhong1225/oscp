@@ -12,7 +12,6 @@ from methods.relational_core import (
     EdgeSetResult,
     RelationalSelectionConfig,
     complete_batches,
-    reference_mask_top_capacity,
     top_edge_set_for_batch,
 )
 
@@ -34,6 +33,7 @@ def relational_oscp_top(
     edge_scores = all_label_scores(test_probs[selection.unit_indices], score=score)
     thresholds = np.empty(selection.n_edges, dtype=float)
     ref_sizes = np.empty(selection.n_edges, dtype=int)
+    threshold_cache: dict[tuple[int, float], tuple[float, int]] = {}
 
     batches = complete_batches(test_support.shape[0], config.batch_size)
     batch_start = np.array([batch[0] for batch in batches], dtype=int)
@@ -43,14 +43,23 @@ def relational_oscp_top(
     ):
         local_j = int(j - batch_start[batch_id])
         batch = batches[batch_id]
-        mask = reference_mask_top_capacity(
-            cal_support[:, a],
-            test_support[batch, a],
-            local_j,
-            int(config.capacities[a]),
-        )
-        ref_sizes[e] = int(np.sum(mask))
-        thresholds[e] = conformal_quantile(cal_scores[mask], alpha)
+        capacity = int(config.capacities[a])
+        others = np.delete(test_support[batch, a], local_j)
+        if capacity <= 0:
+            threshold = np.inf
+        elif others.size < capacity:
+            threshold = -np.inf
+        else:
+            threshold = np.partition(others, others.size - capacity)[
+                others.size - capacity
+            ]
+        key = (int(a), float(threshold))
+        cached = threshold_cache.get(key)
+        if cached is None:
+            mask = cal_support[:, a] >= threshold
+            cached = (conformal_quantile(cal_scores[mask], alpha), int(np.sum(mask)))
+            threshold_cache[key] = cached
+        thresholds[e], ref_sizes[e] = cached
 
     return EdgeSetResult(
         selection=selection,

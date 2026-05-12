@@ -19,11 +19,14 @@ if str(ROOT) not in sys.path:
 from methods.chembl_oscp import (  # noqa: E402
     aggregate_runs,
     edge_label_actionwise_cp,
+    edge_label_bonferroni_cp,
+    edge_label_jomi_unit_top,
     edge_label_marginal_cp,
     edge_label_oscp_top,
     edge_label_selection_thresholds,
+    edge_label_self_calibrating_cp,
     evaluate_edge_label_sets,
-    fit_chembl_target_models,
+    fit_chembl_multitask_model,
     load_chembl36_data,
     make_chembl_splits,
     select_top_edges_masked,
@@ -61,12 +64,6 @@ def round_for_output(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _capacity_vector(capacity: int, n_actions: int) -> np.ndarray:
-    if capacity <= 0:
-        raise ValueError("--capacity must be positive")
-    return np.full(n_actions, capacity, dtype=int)
-
-
 def run_one(
     seed: int,
     data_root: Path,
@@ -100,7 +97,7 @@ def run_one(
         n_bits=n_bits,
         radius=radius,
     )
-    models, model_info = fit_chembl_target_models(
+    models, model_info = fit_chembl_multitask_model(
         split,
         seed=seed,
         max_iter=max_iter,
@@ -113,7 +110,7 @@ def run_one(
 
     config = RelationalSelectionConfig(
         batch_size=batch_size,
-        capacities=_capacity_vector(capacity, len(data.action_names)),
+        capacities=np.full(len(data.action_names), capacity, dtype=int),
     )
     selection = select_top_edges_masked(test_probs, split.observed_test, config)
     if selection.n_edges == 0:
@@ -130,12 +127,11 @@ def run_one(
 
     timed_results = []
 
-    def add_timed_result(make_result):
+    def add_timed_result(make_result) -> None:
         start = time.perf_counter()
-        result = make_result()
-        timed_results.append((result, time.perf_counter() - start))
+        timed_results.append((make_result(), time.perf_counter() - start))
 
-    add_timed_result(
+    for make_result in (
         lambda: edge_label_marginal_cp(
             cal_probs=cal_probs,
             cal_labels=split.y_cal,
@@ -143,9 +139,16 @@ def run_one(
             test_probs=test_probs,
             selection=selection,
             alpha=alpha,
-        )
-    )
-    add_timed_result(
+        ),
+        # lambda: edge_label_bonferroni_cp(
+        #     cal_probs=cal_probs,
+        #     cal_labels=split.y_cal,
+        #     cal_observed=split.observed_cal,
+        #     test_probs=test_probs,
+        #     selection=selection,
+        #     alpha=alpha,
+        #     divisor=len(data.action_names),
+        # ),
         lambda: edge_label_actionwise_cp(
             cal_probs=cal_probs,
             cal_labels=split.y_cal,
@@ -154,9 +157,24 @@ def run_one(
             selection=selection,
             config=config,
             alpha=alpha,
-        )
-    )
-    add_timed_result(
+        ),
+        lambda: edge_label_self_calibrating_cp(
+            cal_probs=cal_probs,
+            cal_labels=split.y_cal,
+            cal_observed=split.observed_cal,
+            test_probs=test_probs,
+            selection=selection,
+            alpha=alpha,
+        ),
+        lambda: edge_label_jomi_unit_top(
+            cal_probs=cal_probs,
+            cal_labels=split.y_cal,
+            cal_observed=split.observed_cal,
+            test_probs=test_probs,
+            selection=selection,
+            config=config,
+            alpha=alpha,
+        ),
         lambda: edge_label_oscp_top(
             cal_probs=cal_probs,
             cal_labels=split.y_cal,
@@ -166,8 +184,9 @@ def run_one(
             selection=selection,
             config=config,
             alpha=alpha,
-        )
-    )
+        ),
+    ):
+        add_timed_result(make_result)
 
     rows = []
     for result, time_sec in timed_results:
@@ -211,6 +230,7 @@ def run_one(
         "n_targets": len(data.action_names),
         "batch_size": batch_size,
         "capacity": capacity,
+        "model_type": model_info["model_type"],
         "device": model_info["device"],
         "mean_val_log_loss": model_info["mean_val_log_loss"],
         "n_train_compounds": int(split.x_train.shape[0]),
@@ -253,7 +273,7 @@ def main() -> None:
     parser.add_argument("--alpha", type=float, default=0.10)
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument("--capacity", type=int, default=25)
-    parser.add_argument("--max-iter", type=int, default=1000)
+    parser.add_argument("--max-iter", type=int, default=200)
     parser.add_argument("--C", type=float, default=1.0)
     parser.add_argument("--cuda", type=int, default=0, help="CUDA device index, defaults to 0.")
     parser.add_argument("--out-dir", type=Path, default=Path("results/chembl36_oscp"))

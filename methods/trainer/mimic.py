@@ -262,7 +262,7 @@ def _one_hot_encoder() -> OneHotEncoder:
 
 
 def _build_mimic_preprocess(split: MimicSplitData) -> ColumnTransformer:
-    """Fit a calibrated multinomial logistic model for MIMIC severity labels."""
+    """Build preprocessing for MIMIC severity features."""
     numeric_cols = split.x_train.select_dtypes(include=[np.number]).columns.tolist()
     categorical_cols = [c for c in split.x_train.columns if c not in numeric_cols]
     return ColumnTransformer(
@@ -290,7 +290,7 @@ def _fit_sklearn_mimic_classifier(split: MimicSplitData, seed: int = 0):
         preprocess,
         LogisticRegression(
             C=1.0,
-            max_iter=1000,
+            max_iter=500,
             random_state=seed,
         ),
     )
@@ -317,7 +317,8 @@ def _fit_torch_mimic_classifier(split: MimicSplitData, seed: int, device: str):
     x_val = x_val_enc.toarray() if hasattr(x_val_enc, "toarray") else np.asarray(x_val_enc)
 
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if device.startswith("cuda"):
+        torch.cuda.manual_seed_all(seed)
     torch_device = torch.device(device)
     x_train_tensor = torch.as_tensor(x_train, dtype=torch.float32, device=torch_device)
     y_train_tensor = torch.as_tensor(split.y_train, dtype=torch.long, device=torch_device)
@@ -329,9 +330,9 @@ def _fit_torch_mimic_classifier(split: MimicSplitData, seed: int, device: str):
 
     best_state = None
     best_val_loss = float("inf")
-    patience = 40
+    patience = 25
     stale_epochs = 0
-    for _ in range(400):
+    for _ in range(250):
         linear.train()
         optimizer.zero_grad()
         train_loss = F.cross_entropy(linear(x_train_tensor), y_train_tensor)
@@ -380,7 +381,10 @@ def _fit_torch_mimic_classifier(split: MimicSplitData, seed: int, device: str):
 
 
 def fit_mimic_classifier(split: MimicSplitData, seed: int = 0, cuda: int | None = None):
-    device = "cpu" if cuda is None else f"cuda:{cuda}"
+    use_cuda = (
+        cuda is not None and cuda >= 0 and torch is not None and torch.cuda.is_available()
+    )
+    device = f"cuda:{cuda}" if use_cuda else "cpu"
     if device == "cpu":
         return _fit_sklearn_mimic_classifier(split, seed=seed)
     return _fit_torch_mimic_classifier(split, seed=seed, device=device)

@@ -91,13 +91,8 @@ def run_one(
     selection = select_top_edges(test_support, config)
 
     timed_results = []
-
-    def add_timed_result(make_result):
-        start = time.perf_counter()
-        result = make_result()
-        timed_results.append((result, time.perf_counter() - start))
-
-    add_timed_result(lambda: relational_marginal_cp(
+    timed_calls = [
+        lambda: relational_marginal_cp(
             cal_probs,
             split.y_cal,
             test_probs,
@@ -105,8 +100,8 @@ def run_one(
             alpha,
             score=score,
             method="Marginal CP",
-        ))
-    add_timed_result(lambda: relational_bonferroni_cp(
+        ),
+        lambda: relational_bonferroni_cp(
             cal_probs,
             split.y_cal,
             test_probs,
@@ -114,17 +109,19 @@ def run_one(
             alpha,
             divisor=len(relation_spec.action_names),
             score=score,
-        ))
-    add_timed_result(lambda: action_wise_cp(
+        ),
+        lambda: action_wise_cp(
             cal_probs,
             split.y_cal,
             test_probs,
             selection,
             relation_spec.relation,
             alpha,
-        ))
+        ),
+    ]
     if split.y_test.size <= 1000:
-        add_timed_result(lambda: relational_swap_cp(
+        timed_calls.append(
+            lambda: relational_swap_cp(
                 cal_probs,
                 split.y_cal,
                 cal_support,
@@ -134,37 +131,46 @@ def run_one(
                 config,
                 alpha,
                 score=score,
-            ))
-    add_timed_result(lambda: relational_self_calibrating_cp(
-            cal_probs,
-            split.y_cal,
-            test_probs,
-            selection,
-            alpha,
-            score=score,
-        ))
-    add_timed_result(lambda: relational_jomi_unit_top(
-            cal_probs,
-            split.y_cal,
-            cal_support,
-            test_probs,
-            test_support,
-            selection,
-            config,
-            alpha,
-            score=score,
-        ))
-    add_timed_result(lambda: relational_oscp_top(
-            cal_probs,
-            split.y_cal,
-            cal_support,
-            test_probs,
-            test_support,
-            selection,
-            config,
-            alpha,
-            score=score,
-        ))
+            )
+        )
+    timed_calls.extend(
+        [
+            lambda: relational_self_calibrating_cp(
+                cal_probs,
+                split.y_cal,
+                test_probs,
+                selection,
+                alpha,
+                score=score,
+            ),
+            lambda: relational_jomi_unit_top(
+                cal_probs,
+                split.y_cal,
+                cal_support,
+                test_probs,
+                test_support,
+                selection,
+                config,
+                alpha,
+                score=score,
+            ),
+            lambda: relational_oscp_top(
+                cal_probs,
+                split.y_cal,
+                cal_support,
+                test_probs,
+                test_support,
+                selection,
+                config,
+                alpha,
+                score=score,
+            ),
+        ]
+    )
+
+    for make_result in timed_calls:
+        start = time.perf_counter()
+        timed_results.append((make_result(), time.perf_counter() - start))
 
     rows = []
     for result, time_sec in timed_results:

@@ -12,24 +12,22 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
-
 from scipy import sparse
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.feature_extraction.text import HashingVectorizer
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
 from sklearn.model_selection import train_test_split
 
+from methods.baselines.relational import self_calibrating_score_thresholds
 from methods.conformal import conformal_quantile
-from methods.relational_core import EdgeSelection, EdgeSetResult, RelationalSelectionConfig
+from methods.relational_core import (
+    EdgeSelection,
+    EdgeSetResult,
+    RelationalSelectionConfig,
+    reference_mask_top_capacity,
+)
 
-try:
-    from sklearn.frozen import FrozenEstimator
-except ModuleNotFoundError:  # scikit-learn < 1.6
-    FrozenEstimator = None
 
-
-CHEMBL_LABELS = ("inactive", "active")
+CHEMBL_FEATURE_CACHE_DIR = Path("results/cache/chembl36_features")
 
 
 @dataclass(frozen=True)
@@ -63,45 +61,46 @@ class ChemblSplitData:
     test_compounds: pd.DataFrame
 
 
+class MultiTaskMLP(torch.nn.Module):
+    """Shared compound encoder with one binary activity logit per target."""
+
+    def __init__(self, d_in: int, n_targets: int) -> None:
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(d_in, 512),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.2),
+            torch.nn.Linear(512, 256),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.2),
+            torch.nn.Linear(256, n_targets),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 @dataclass
-class ChemblTargetModels:
-    classifiers: tuple[Any, ...]
+class ChemblMultiTaskActivityPredictor:
+    model: MultiTaskMLP
+    device: str
+    batch_size: int = 4096
 
     def predict_active_proba(self, x: sparse.csr_matrix) -> np.ndarray:
-        probs = []
-        for clf in self.classifiers:
-            pred = clf.predict_proba(x)
-            probs.append(pred[:, -1])
-        return np.column_stack(probs)
-
-
-@dataclass
-class TorchChemblBinaryClassifier:
-    linear: Any
-    temperature: float
-
-    def predict_proba(self, x: sparse.csr_matrix) -> np.ndarray:
         if torch is None:
-            raise RuntimeError("PyTorch is required for CUDA training.")
-        x_np = x.toarray() if hasattr(x, "toarray") else np.asarray(x)
-        self.linear.eval()
+            raise RuntimeError("PyTorch is required for ChEMBL multi-task training.")
+        self.model.eval()
+        probs: list[np.ndarray] = []
         with torch.no_grad():
-            x_tensor = torch.as_tensor(
-                x_np, dtype=torch.float32, device=self.linear.weight.device
-            )
-            logits = self.linear(x_tensor) / self.temperature
-            probs = torch.softmax(logits, dim=1)
-        return probs.cpu().numpy()
-
-
-@dataclass
-class ConstantBinaryClassifier:
-    probability: float
-
-    def predict_proba(self, x: sparse.csr_matrix) -> np.ndarray:
-        n = x.shape[0]
-        p = float(np.clip(self.probability, 0.0, 1.0))
-        return np.column_stack([np.full(n, 1.0 - p), np.full(n, p)])
+            for start in range(0, x.shape[0], self.batch_size):
+                stop = min(start + self.batch_size, x.shape[0])
+                x_batch = _as_dense_float32(x[start:stop])
+                x_tensor = torch.as_tensor(x_batch, dtype=torch.float32, device=self.device)
+                batch_probs = torch.sigmoid(self.model(x_tensor)).cpu().numpy()
+                probs.append(batch_probs)
+        if probs:
+            return np.vstack(probs)
+        return np.empty((0, self.model.net[-1].out_features))
 
 
 def extract_raw_chembl_edges(
@@ -366,7 +365,7 @@ def _morgan_fingerprint_matrix(
         from rdkit import Chem
         from rdkit.Chem import AllChem
     except ModuleNotFoundError as exc:
-        raise RuntimeError("RDKit is required for --fingerprint morgan.") from exc
+        raise RuntimeError("RDKit is required for Morgan fingerprints.") from exc
 
     rows: list[int] = []
     cols: list[int] = []
@@ -410,13 +409,28 @@ def build_compound_features(
     smiles = compounds["canonical_smiles"].fillna("").astype(str).tolist()
     if fingerprint not in {"auto", "morgan", "hashed_smiles"}:
         raise ValueError(f"unknown fingerprint: {fingerprint}")
+
     if fingerprint in {"auto", "morgan"}:
         try:
-            return _morgan_fingerprint_matrix(smiles, n_bits=n_bits, radius=radius), "morgan"
+            cache_path = CHEMBL_FEATURE_CACHE_DIR / (
+                f"morgan_n{len(smiles)}_bits{n_bits}_r{radius}.npz"
+            )
+            if cache_path.exists():
+                return sparse.load_npz(cache_path).tocsr(), "morgan"
+            features = _morgan_fingerprint_matrix(smiles, n_bits=n_bits, radius=radius)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            sparse.save_npz(cache_path, features)
+            return features, "morgan"
         except RuntimeError:
             if fingerprint == "morgan":
                 raise
-    return _hashed_smiles_matrix(smiles, n_bits=n_bits), "hashed_smiles"
+    cache_path = CHEMBL_FEATURE_CACHE_DIR / f"hashed_smiles_n{len(smiles)}_bits{n_bits}.npz"
+    if cache_path.exists():
+        return sparse.load_npz(cache_path).tocsr(), "hashed_smiles"
+    features = _hashed_smiles_matrix(smiles, n_bits=n_bits)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    sparse.save_npz(cache_path, features)
+    return features, "hashed_smiles"
 
 
 def _label_matrix(
@@ -492,58 +506,136 @@ def make_chembl_splits(
     )
 
 
-def _calibrate_prefit(estimator: Any, x_val: sparse.csr_matrix, y_val: np.ndarray) -> Any:
-    if FrozenEstimator is None:
-        model = CalibratedClassifierCV(estimator, method="sigmoid", cv="prefit")
-    else:
-        model = CalibratedClassifierCV(FrozenEstimator(estimator), method="sigmoid")
-    model.fit(x_val, y_val)
-    return model
+def _as_dense_float32(x: sparse.csr_matrix | np.ndarray) -> np.ndarray:
+    x_np = x.toarray() if hasattr(x, "toarray") else np.asarray(x)
+    return x_np.astype(np.float32, copy=False)
 
 
-def _fit_torch_binary_classifier(
-    x_train: sparse.csr_matrix,
-    y_train: np.ndarray,
-    x_val: sparse.csr_matrix,
-    y_val: np.ndarray,
-    seed: int,
+def _masked_bce_with_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    observed: torch.Tensor,
+) -> torch.Tensor:
+    loss_raw = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
+    observed = observed.to(dtype=loss_raw.dtype)
+    return (loss_raw * observed).sum() / observed.sum().clamp_min(1.0)
+
+
+def _choose_torch_device(cuda: int | None) -> str:
+    if cuda is not None and cuda >= 0 and torch.cuda.is_available():
+        return f"cuda:{cuda}"
+    return "cpu"
+
+
+def _evaluate_masked_val_loss(
+    model: MultiTaskMLP,
+    x: sparse.csr_matrix,
+    y: np.ndarray,
+    observed: np.ndarray,
     device: str,
-) -> tuple[TorchChemblBinaryClassifier, float]:
+    batch_size: int,
+) -> float:
+    rows = np.where(observed.any(axis=1))[0]
+    if rows.size == 0:
+        return np.nan
+    model.eval()
+    losses = []
+    weights = []
+    with torch.no_grad():
+        for start in range(0, rows.size, batch_size):
+            batch = rows[start : start + batch_size]
+            x_batch = _as_dense_float32(x[batch])
+            mask_batch = observed[batch]
+            y_batch = np.where(mask_batch, y[batch], 0).astype(np.float32, copy=False)
+            x_tensor = torch.as_tensor(x_batch, dtype=torch.float32, device=device)
+            y_tensor = torch.as_tensor(y_batch, dtype=torch.float32, device=device)
+            mask_tensor = torch.as_tensor(mask_batch, dtype=torch.bool, device=device)
+            n_obs = int(mask_batch.sum())
+            losses.append(
+                float(_masked_bce_with_logits(model(x_tensor), y_tensor, mask_tensor).item())
+            )
+            weights.append(n_obs)
+    return float(np.average(losses, weights=weights))
+
+
+def fit_chembl_multitask_model(
+    split: ChemblSplitData,
+    seed: int = 0,
+    max_iter: int = 200,
+    C: float = 1.0,
+    cuda: int | None = None,
+) -> tuple[ChemblMultiTaskActivityPredictor, dict[str, Any]]:
+    """Fit a multi-task active/inactive predictor with one output head per target."""
     if torch is None or F is None:
-        raise RuntimeError("PyTorch is required for CUDA training.")
+        raise RuntimeError("PyTorch is required for ChEMBL multi-task training.")
 
-    x_train_np = x_train.toarray() if hasattr(x_train, "toarray") else np.asarray(x_train)
-    x_val_np = x_val.toarray() if hasattr(x_val, "toarray") else np.asarray(x_val)
-
+    _ = C
+    n_actions = split.y_train.shape[1]
+    device = _choose_torch_device(cuda)
+    torch_device = torch.device(device)
     torch.manual_seed(seed)
     if device.startswith("cuda"):
         torch.cuda.manual_seed_all(seed)
-    torch_device = torch.device(device)
-    x_train_tensor = torch.as_tensor(x_train_np, dtype=torch.float32, device=torch_device)
-    y_train_tensor = torch.as_tensor(y_train, dtype=torch.long, device=torch_device)
-    x_val_tensor = torch.as_tensor(x_val_np, dtype=torch.float32, device=torch_device)
-    y_val_tensor = torch.as_tensor(y_val, dtype=torch.long, device=torch_device)
 
-    linear = torch.nn.Linear(x_train_np.shape[1], len(CHEMBL_LABELS), device=torch_device)
-    optimizer = torch.optim.AdamW(linear.parameters(), lr=0.03, weight_decay=1e-4)
+    train_edges = split.observed_train.sum(axis=0).astype(int).tolist()
+    val_edges = split.observed_val.sum(axis=0).astype(int).tolist()
+    train_rows = np.where(split.observed_train.any(axis=1))[0]
+    if train_rows.size == 0:
+        raise ValueError("No observed ChEMBL training labels.")
 
+    model = MultiTaskMLP(split.x_train.shape[1], n_actions).to(torch_device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    rng = np.random.default_rng(seed)
+    batch_size = 2048
+    patience = 30
     best_state = None
     best_val_loss = float("inf")
-    patience = 40
     stale_epochs = 0
-    for _ in range(400):
-        linear.train()
-        optimizer.zero_grad()
-        train_loss = F.cross_entropy(linear(x_train_tensor), y_train_tensor)
-        train_loss.backward()
-        optimizer.step()
 
-        linear.eval()
-        with torch.no_grad():
-            val_loss = F.cross_entropy(linear(x_val_tensor), y_val_tensor).item()
-        if val_loss + 1e-6 < best_val_loss:
-            best_val_loss = val_loss
-            best_state = {k: v.detach().clone() for k, v in linear.state_dict().items()}
+    for _ in range(max_iter):
+        model.train()
+        rng.shuffle(train_rows)
+        for start in range(0, train_rows.size, batch_size):
+            batch = train_rows[start : start + batch_size]
+            x_batch = _as_dense_float32(split.x_train[batch])
+            mask_batch = split.observed_train[batch]
+            y_batch = np.where(mask_batch, split.y_train[batch], 0).astype(
+                np.float32,
+                copy=False,
+            )
+            x_tensor = torch.as_tensor(x_batch, dtype=torch.float32, device=torch_device)
+            y_tensor = torch.as_tensor(y_batch, dtype=torch.float32, device=torch_device)
+            mask_tensor = torch.as_tensor(mask_batch, dtype=torch.bool, device=torch_device)
+
+            optimizer.zero_grad()
+            loss = _masked_bce_with_logits(model(x_tensor), y_tensor, mask_tensor)
+            loss.backward()
+            optimizer.step()
+
+        val_loss = _evaluate_masked_val_loss(
+            model,
+            split.x_val,
+            split.y_val,
+            split.observed_val,
+            device,
+            batch_size=4096,
+        )
+        early_stop_loss = val_loss
+        if np.isnan(early_stop_loss):
+            early_stop_loss = _evaluate_masked_val_loss(
+                model,
+                split.x_train,
+                split.y_train,
+                split.observed_train,
+                device,
+                batch_size=4096,
+            )
+        if early_stop_loss + 1e-6 < best_val_loss:
+            best_val_loss = early_stop_loss
+            best_state = {
+                k: v.detach().cpu().clone()
+                for k, v in model.state_dict().items()
+            }
             stale_epochs = 0
         else:
             stale_epochs += 1
@@ -551,94 +643,33 @@ def _fit_torch_binary_classifier(
                 break
 
     if best_state is not None:
-        linear.load_state_dict(best_state)
+        model.load_state_dict(best_state)
+    model.to(torch_device)
 
-    temperature = torch.nn.Parameter(torch.ones(1, device=torch_device))
-    temp_optimizer = torch.optim.LBFGS(
-        [temperature], lr=0.1, max_iter=50, line_search_fn="strong_wolfe"
-    )
-
-    def closure():
-        temp_optimizer.zero_grad()
-        temp = temperature.clamp_min(1e-3)
-        loss = F.cross_entropy(linear(x_val_tensor) / temp, y_val_tensor)
-        loss.backward()
-        return loss
-
-    temp_optimizer.step(closure)
-    model = TorchChemblBinaryClassifier(
-        linear=linear,
-        temperature=float(temperature.detach().clamp_min(1e-3).item()),
-    )
-    p_val = np.clip(model.predict_proba(x_val)[:, -1], 1e-6, 1.0 - 1e-6)
-    val_loss = float(
-        log_loss(y_val, np.column_stack([1.0 - p_val, p_val]), labels=[0, 1])
-    )
-    return model, val_loss
-
-
-def fit_chembl_target_models(
-    split: ChemblSplitData,
-    seed: int = 0,
-    max_iter: int = 1000,
-    C: float = 1.0,
-    cuda: int | None = None,
-) -> tuple[ChemblTargetModels, dict[str, Any]]:
-    """Fit one binary active/inactive classifier per target."""
-    n_actions = split.y_train.shape[1]
-    classifiers: list[Any] = []
+    predictor = ChemblMultiTaskActivityPredictor(model=model, device=device)
+    val_probs = predictor.predict_active_proba(split.x_val)
     val_losses: list[float] = []
-    train_edges = []
-    val_edges = []
-    device = "cpu" if cuda is None else f"cuda:{cuda}"
-
     for a in range(n_actions):
-        train_mask = split.observed_train[:, a]
         val_mask = split.observed_val[:, a]
-        y_train = split.y_train[train_mask, a].astype(int)
         y_val = split.y_val[val_mask, a].astype(int)
-        train_edges.append(int(train_mask.sum()))
-        val_edges.append(int(val_mask.sum()))
-
-        if np.unique(y_train).size < 2:
-            clf: Any = ConstantBinaryClassifier(float(np.mean(y_train)) if y_train.size else 0.0)
-        else:
-            if device == "cpu":
-                base = LogisticRegression(
-                    C=C,
-                    max_iter=max_iter,
-                    class_weight="balanced",
-                    solver="liblinear",
-                    random_state=seed + a,
-                )
-                base.fit(split.x_train[train_mask], y_train)
-                if y_val.size > 0 and np.unique(y_val).size == 2:
-                    clf = _calibrate_prefit(base, split.x_val[val_mask], y_val)
-                else:
-                    clf = base
-            else:
-                if y_val.size > 0 and np.unique(y_val).size == 2:
-                    clf, _ = _fit_torch_binary_classifier(
-                        split.x_train[train_mask],
-                        y_train,
-                        split.x_val[val_mask],
-                        y_val,
-                        seed=seed + a,
-                        device=device,
-                    )
-                else:
-                    clf = ConstantBinaryClassifier(float(np.mean(y_train)) if y_train.size else 0.0)
-        classifiers.append(clf)
-
         if y_val.size > 0:
-            p_val = np.clip(clf.predict_proba(split.x_val[val_mask])[:, -1], 1e-6, 1.0 - 1e-6)
-            val_losses.append(float(log_loss(y_val, np.column_stack([1.0 - p_val, p_val]), labels=[0, 1])))
+            p_val = np.clip(val_probs[val_mask, a], 1e-6, 1.0 - 1e-6)
+            val_losses.append(
+                float(
+                    log_loss(
+                        y_val,
+                        np.column_stack([1.0 - p_val, p_val]),
+                        labels=[0, 1],
+                    )
+                )
+            )
         else:
             val_losses.append(np.nan)
 
     return (
-        ChemblTargetModels(classifiers=tuple(classifiers)),
+        predictor,
         {
+            "model_type": "multi_task_mlp",
             "mean_val_log_loss": float(np.nanmean(val_losses)),
             "target_val_log_loss": val_losses,
             "target_train_edges": train_edges,
@@ -727,6 +758,21 @@ def _binary_all_scores(p_active: np.ndarray) -> np.ndarray:
     return np.column_stack([p_active, 1.0 - p_active])
 
 
+def _selected_edge_probs(
+    probs: np.ndarray,
+    selection: EdgeSelection,
+) -> np.ndarray:
+    return probs[selection.unit_indices, selection.action_indices]
+
+
+def _observed_binary_scores(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    observed: np.ndarray,
+) -> np.ndarray:
+    return _binary_label_scores(probs[observed], labels[observed])
+
+
 def edge_label_marginal_cp(
     cal_probs: np.ndarray,
     cal_labels: np.ndarray,
@@ -736,9 +782,9 @@ def edge_label_marginal_cp(
     alpha: float,
     method: str = "Marginal CP",
 ) -> EdgeSetResult:
-    scores = _binary_label_scores(cal_probs[cal_observed], cal_labels[cal_observed])
+    scores = _observed_binary_scores(cal_probs, cal_labels, cal_observed)
     q = conformal_quantile(scores, alpha)
-    p_edge = test_probs[selection.unit_indices, selection.action_indices]
+    p_edge = _selected_edge_probs(test_probs, selection)
     edge_scores = _binary_all_scores(p_edge)
     return EdgeSetResult(
         selection=selection,
@@ -778,7 +824,7 @@ def edge_label_actionwise_cp(
         thresholds[a] = conformal_quantile(scores, alpha)
         ref_sizes[a] = int(scores.size)
 
-    p_edge = test_probs[selection.unit_indices, selection.action_indices]
+    p_edge = _selected_edge_probs(test_probs, selection)
     edge_scores = _binary_all_scores(p_edge)
     edge_thresholds = thresholds[selection.action_indices]
     return EdgeSetResult(
@@ -786,6 +832,121 @@ def edge_label_actionwise_cp(
         sets=edge_scores <= edge_thresholds[:, None],
         thresholds=edge_thresholds,
         reference_sizes=ref_sizes[selection.action_indices],
+        method=method,
+    )
+
+
+def edge_label_bonferroni_cp(
+    cal_probs: np.ndarray,
+    cal_labels: np.ndarray,
+    cal_observed: np.ndarray,
+    test_probs: np.ndarray,
+    selection: EdgeSelection,
+    alpha: float,
+    divisor: int,
+    method: str | None = None,
+) -> EdgeSetResult:
+    adjusted_method = method or f"Bonferroni CP (alpha/{divisor})"
+    return edge_label_marginal_cp(
+        cal_probs=cal_probs,
+        cal_labels=cal_labels,
+        cal_observed=cal_observed,
+        test_probs=test_probs,
+        selection=selection,
+        alpha=alpha / divisor,
+        method=adjusted_method,
+    )
+
+
+def edge_label_self_calibrating_cp(
+    cal_probs: np.ndarray,
+    cal_labels: np.ndarray,
+    cal_observed: np.ndarray,
+    test_probs: np.ndarray,
+    selection: EdgeSelection,
+    alpha: float,
+    method: str = "SC-CP",
+    num_bin_predictor: int = 15,
+    num_bin_score: int = 60,
+) -> EdgeSetResult:
+    cal_scores = _observed_binary_scores(cal_probs, cal_labels, cal_observed)
+    cal_predictor = np.minimum(cal_probs[cal_observed], 1.0 - cal_probs[cal_observed])
+    p_edge = _selected_edge_probs(test_probs, selection)
+    edge_predictor = np.minimum(p_edge, 1.0 - p_edge)
+    thresholds = self_calibrating_score_thresholds(
+        cal_scores,
+        cal_predictor,
+        edge_predictor,
+        alpha,
+        num_bin_predictor=num_bin_predictor,
+        num_bin_score=num_bin_score,
+    )
+    edge_scores = _binary_all_scores(p_edge)
+    return EdgeSetResult(
+        selection=selection,
+        sets=edge_scores <= thresholds[:, None],
+        thresholds=thresholds,
+        reference_sizes=np.full(selection.n_edges, cal_scores.size, dtype=int),
+        method=method,
+    )
+
+
+def edge_label_jomi_unit_top(
+    cal_probs: np.ndarray,
+    cal_labels: np.ndarray,
+    cal_observed: np.ndarray,
+    test_probs: np.ndarray,
+    selection: EdgeSelection,
+    config: RelationalSelectionConfig,
+    alpha: float,
+    method: str = "JOMI",
+) -> EdgeSetResult:
+    cal_scores_matrix = np.full(cal_probs.shape, np.nan, dtype=float)
+    cal_scores_matrix[cal_observed] = _observed_binary_scores(
+        cal_probs,
+        cal_labels,
+        cal_observed,
+    )
+    p_edge = _selected_edge_probs(test_probs, selection)
+    edge_scores = _binary_all_scores(p_edge)
+    thresholds = np.empty(selection.n_edges, dtype=float)
+    ref_sizes = np.empty(selection.n_edges, dtype=int)
+
+    batches = complete_batches(test_probs.shape[0], config.batch_size)
+    batch_start = np.array([batch[0] for batch in batches], dtype=int)
+    mask_cache: dict[tuple[int, int], np.ndarray] = {}
+
+    for edge_index, (unit_index, batch_index) in enumerate(
+        zip(selection.unit_indices, selection.batch_indices)
+    ):
+        local_index = int(unit_index - batch_start[int(batch_index)])
+        cache_key = (int(batch_index), local_index)
+        reference_mask = mask_cache.get(cache_key)
+        if reference_mask is None:
+            batch = batches[int(batch_index)]
+            reference_mask = np.zeros(cal_probs.shape, dtype=bool)
+            for action_index, capacity in enumerate(config.capacities):
+                if capacity <= 0:
+                    continue
+                candidate_units = reference_mask_top_capacity(
+                    cal_probs[:, action_index],
+                    test_probs[batch, action_index],
+                    local_index,
+                    int(capacity),
+                )
+                reference_mask[:, action_index] = (
+                    cal_observed[:, action_index] & candidate_units
+                )
+            mask_cache[cache_key] = reference_mask
+        reference_scores = cal_scores_matrix[reference_mask]
+        ref_sizes[edge_index] = int(reference_scores.size)
+        thresholds[edge_index] = conformal_quantile(reference_scores, alpha)
+
+    return EdgeSetResult(
+        selection=selection,
+        sets=edge_scores <= thresholds[:, None],
+        thresholds=thresholds,
+        reference_sizes=ref_sizes,
         method=method,
     )
 
@@ -801,7 +962,7 @@ def edge_label_oscp_top(
     alpha: float,
     method: str = "OSCP",
 ) -> EdgeSetResult:
-    p_edge = test_probs[selection.unit_indices, selection.action_indices]
+    p_edge = _selected_edge_probs(test_probs, selection)
     edge_scores = _binary_all_scores(p_edge)
     edge_thresholds = edge_label_selection_thresholds(
         test_probs,
@@ -811,12 +972,17 @@ def edge_label_oscp_top(
     )
     thresholds = np.empty(selection.n_edges, dtype=float)
     ref_sizes = np.empty(selection.n_edges, dtype=int)
+    threshold_cache: dict[tuple[int, float], tuple[float, int]] = {}
 
     for e, a in enumerate(selection.action_indices):
-        ref = cal_observed[:, a] & (cal_probs[:, a] >= edge_thresholds[e])
-        scores = _binary_label_scores(cal_probs[ref, a], cal_labels[ref, a])
-        ref_sizes[e] = int(scores.size)
-        thresholds[e] = conformal_quantile(scores, alpha)
+        key = (int(a), float(edge_thresholds[e]))
+        cached = threshold_cache.get(key)
+        if cached is None:
+            ref = cal_observed[:, a] & (cal_probs[:, a] >= edge_thresholds[e])
+            scores = _binary_label_scores(cal_probs[ref, a], cal_labels[ref, a])
+            cached = (conformal_quantile(scores, alpha), int(scores.size))
+            threshold_cache[key] = cached
+        thresholds[e], ref_sizes[e] = cached
 
     return EdgeSetResult(
         selection=selection,
@@ -855,7 +1021,7 @@ def evaluate_edge_label_sets(
 
     action_covs = []
     under_gaps = []
-    for a, name in enumerate(action_names):
+    for a, _ in enumerate(action_names):
         short = f"target_{a}"
         mask = result.selection.action_indices == a
         if not np.any(mask):

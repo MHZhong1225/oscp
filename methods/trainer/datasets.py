@@ -39,6 +39,7 @@ NURSERY_LABELS = np.array(["not_recom", "very_recom", "priority", "spec_prior"])
 BACH_LABELS = np.array(["Benign", "InSitu", "Invasive", "Normal"])
 NURSERY_CRITICAL_CLASS = 3
 BACH_CRITICAL_CLASS = 2
+BACH_FEATURE_CACHE_DIR = Path("results/cache/bach_features")
 
 
 @dataclass(frozen=True)
@@ -180,23 +181,44 @@ def load_bach_splits(
     backbone_name: str = "resnet18",
     pretrained: bool = True,
     feature_batch_size: int = 32,
-    num_workers: int = 4,
+    num_workers: int = 8,
     device: str = "cpu",
 ) -> DatasetSplitData:
     """Load BACH ImageFolder splits and extract frozen backbone features."""
     if torch is None:
         raise RuntimeError("PyTorch is required for BACH backbone features.")
-    backbone, _ = create_backbone(backbone_name, pretrained=pretrained)
-    backbone = backbone.to(device)
-    x_train, y_train = _extract_backbone_features(
-        root, "train", backbone, image_size, feature_batch_size, num_workers, device
+
+    cache_path = BACH_FEATURE_CACHE_DIR / (
+        f"{root.name}_{backbone_name}_{image_size}_pretrained{int(pretrained)}.npz"
     )
-    x_val, y_val = _extract_backbone_features(
-        root, "val", backbone, image_size, feature_batch_size, num_workers, device
-    )
-    x_holdout, y_holdout = _extract_backbone_features(
-        root, "test", backbone, image_size, feature_batch_size, num_workers, device
-    )
+    if cache_path.exists():
+        with np.load(cache_path) as cached:
+            x_train, y_train = cached["x_train"], cached["y_train"]
+            x_val, y_val = cached["x_val"], cached["y_val"]
+            x_holdout, y_holdout = cached["x_holdout"], cached["y_holdout"]
+    else:
+        backbone, _ = create_backbone(backbone_name, pretrained=pretrained)
+        backbone = backbone.to(device)
+        x_train, y_train = _extract_backbone_features(
+            root, "train", backbone, image_size, feature_batch_size, num_workers, device
+        )
+        x_val, y_val = _extract_backbone_features(
+            root, "val", backbone, image_size, feature_batch_size, num_workers, device
+        )
+        x_holdout, y_holdout = _extract_backbone_features(
+            root, "test", backbone, image_size, feature_batch_size, num_workers, device
+        )
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            cache_path,
+            x_train=x_train,
+            y_train=y_train,
+            x_val=x_val,
+            y_val=y_val,
+            x_holdout=x_holdout,
+            y_holdout=y_holdout,
+        )
+
     idx = np.arange(y_holdout.size)
     cal_idx, test_idx = train_test_split(
         idx,
@@ -253,7 +275,7 @@ def make_dataset_splits(data: DatasetData, seed: int = 0) -> DatasetSplitData:
 def _fit_sklearn_classifier(split: DatasetSplitData, seed: int = 0):
     base = make_pipeline(
         StandardScaler(),
-        LogisticRegression(C=1.0, max_iter=2000, random_state=seed),
+        LogisticRegression(C=1.0, max_iter=500, random_state=seed),
     )
     base.fit(split.x_train, split.y_train)
     try:
@@ -276,7 +298,8 @@ def _fit_torch_classifier(split: DatasetSplitData, seed: int, device: str):
         raise RuntimeError("PyTorch is required for CUDA training.")
 
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if device.startswith("cuda"):
+        torch.cuda.manual_seed_all(seed)
     torch_device = torch.device(device)
     x_train = torch.as_tensor(split.x_train, dtype=torch.float32, device=torch_device)
     y_train = torch.as_tensor(split.y_train, dtype=torch.long, device=torch_device)
@@ -294,7 +317,7 @@ def _fit_torch_classifier(split: DatasetSplitData, seed: int, device: str):
     best_state = None
     best_val_loss = float("inf")
     stale_epochs = 0
-    for _ in range(400):
+    for _ in range(250):
         linear.train()
         optimizer.zero_grad()
         loss = F.cross_entropy(linear(x_train), y_train)
@@ -310,7 +333,7 @@ def _fit_torch_classifier(split: DatasetSplitData, seed: int, device: str):
             stale_epochs = 0
         else:
             stale_epochs += 1
-            if stale_epochs >= 40:
+            if stale_epochs >= 25:
                 break
 
     if best_state is not None:
@@ -344,7 +367,8 @@ def _fit_torch_classifier(split: DatasetSplitData, seed: int, device: str):
 
 
 def fit_dataset_classifier(split: DatasetSplitData, seed: int = 0, cuda: int | None = None):
-    device = "cpu" if cuda is None else f"cuda:{cuda}"
+    use_cuda = cuda is not None and cuda >= 0 and torch is not None and torch.cuda.is_available()
+    device = f"cuda:{cuda}" if use_cuda else "cpu"
     if device == "cpu":
         return _fit_sklearn_classifier(split, seed=seed)
     return _fit_torch_classifier(split, seed=seed, device=device)

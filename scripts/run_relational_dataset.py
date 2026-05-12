@@ -119,10 +119,11 @@ def format_for_csv(df: pd.DataFrame) -> pd.DataFrame:
 
 def load_split(args: argparse.Namespace, seed: int):
     if args.dataset == "nursery":
-        data = load_nursery_data(path=args.nursery_csv, n=args.n, seed=seed)
-        return make_dataset_splits(data, seed=seed)
+        return make_dataset_splits(
+            load_nursery_data(path=args.nursery_csv, n=args.n, seed=seed),
+            seed=seed,
+        )
     if args.dataset == "bach":
-        feature_device = "cpu" if args.cuda is None else f"cuda:{args.cuda}"
         return load_bach_splits(
             root=args.bach_root,
             seed=seed,
@@ -131,7 +132,7 @@ def load_split(args: argparse.Namespace, seed: int):
             pretrained=not args.no_pretrained,
             feature_batch_size=args.feature_batch_size,
             num_workers=args.num_workers,
-            device=feature_device,
+            device="cpu" if args.cuda is None else f"cuda:{args.cuda}",
         )
     raise ValueError(f"unknown dataset: {args.dataset}")
 
@@ -153,80 +154,86 @@ def run_one(args: argparse.Namespace, seed: int) -> tuple[pd.DataFrame, dict]:
         )
 
     timed_results = []
-
-    def add_timed_result(make_result):
-        start = time.perf_counter()
-        result = make_result()
-        timed_results.append((result, time.perf_counter() - start))
-
-    add_timed_result(lambda: relational_marginal_cp(
-        cal_probs,
-        split.y_cal,
-        test_probs,
-        selection,
-        args.alpha,
-        score=args.score,
-        method="Marginal CP",
-    ))
-    add_timed_result(lambda: relational_bonferroni_cp(
-        cal_probs,
-        split.y_cal,
-        test_probs,
-        selection,
-        args.alpha,
-        divisor=len(relation_spec.action_names),
-        score=args.score,
-    ))
-    add_timed_result(lambda: action_wise_cp(
-        cal_probs,
-        split.y_cal,
-        test_probs,
-        selection,
-        relation_spec.relation,
-        args.alpha,
-    ))
-    if args.include_swap:
-        add_timed_result(lambda: relational_swap_cp(
+    timed_calls = [
+        lambda: relational_marginal_cp(
             cal_probs,
             split.y_cal,
-            cal_support,
             test_probs,
-            test_support,
             selection,
-            config,
             args.alpha,
             score=args.score,
-        ))
-    add_timed_result(lambda: relational_self_calibrating_cp(
-        cal_probs,
-        split.y_cal,
-        test_probs,
-        selection,
-        args.alpha,
-        score=args.score,
-    ))
-    add_timed_result(lambda: relational_jomi_unit_top(
-        cal_probs,
-        split.y_cal,
-        cal_support,
-        test_probs,
-        test_support,
-        selection,
-        config,
-        args.alpha,
-        score=args.score,
-    ))
-    add_timed_result(lambda: relational_oscp_top(
-        cal_probs,
-        split.y_cal,
-        cal_support,
-        test_probs,
-        test_support,
-        selection,
-        config,
-        args.alpha,
-        score=args.score,
-    ))
+            method="Marginal CP",
+        ),
+        lambda: relational_bonferroni_cp(
+            cal_probs,
+            split.y_cal,
+            test_probs,
+            selection,
+            args.alpha,
+            divisor=len(relation_spec.action_names),
+            score=args.score,
+        ),
+        lambda: action_wise_cp(
+            cal_probs,
+            split.y_cal,
+            test_probs,
+            selection,
+            relation_spec.relation,
+            args.alpha,
+        ),
+    ]
+    if args.include_swap:
+        timed_calls.append(
+            lambda: relational_swap_cp(
+                cal_probs,
+                split.y_cal,
+                cal_support,
+                test_probs,
+                test_support,
+                selection,
+                config,
+                args.alpha,
+                score=args.score,
+            )
+        )
+    timed_calls.extend(
+        [
+            lambda: relational_self_calibrating_cp(
+                cal_probs,
+                split.y_cal,
+                test_probs,
+                selection,
+                args.alpha,
+                score=args.score,
+            ),
+            lambda: relational_jomi_unit_top(
+                cal_probs,
+                split.y_cal,
+                cal_support,
+                test_probs,
+                test_support,
+                selection,
+                config,
+                args.alpha,
+                score=args.score,
+            ),
+            lambda: relational_oscp_top(
+                cal_probs,
+                split.y_cal,
+                cal_support,
+                test_probs,
+                test_support,
+                selection,
+                config,
+                args.alpha,
+                score=args.score,
+            ),
+        ]
+    )
+
+    for make_result in timed_calls:
+        start = time.perf_counter()
+        timed_results.append((make_result(), time.perf_counter() - start))
 
     rows = []
     for result, time_sec in timed_results:
@@ -280,8 +287,8 @@ def main() -> None:
         default="resnet18",
     )
     parser.add_argument("--no-pretrained", action="store_true")
-    parser.add_argument("--feature-batch-size", type=int, default=32)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--feature-batch-size", type=int, default=128)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--include-swap", action="store_true")
     parser.add_argument("--verbose", action="store_true", help="Print per-seed diagnostics and tables.")
     parser.add_argument("--out-dir", type=Path, default=None)
