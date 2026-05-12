@@ -7,14 +7,18 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from methods.evaluate import to_percent_table
-
-import numpy as np
-import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from methods.evaluate import to_percent_table
+
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+
 
 from methods.relational_core import (
     RelationSpec,
@@ -32,7 +36,7 @@ from methods.baselines import (
     relational_self_calibrating_cp,
 )
 from methods.oscp import relational_oscp_top, relational_swap_cp
-from methods.synthetic import (
+from methods.trainer.synthetic import (
     CRITICAL_CLASS,
     LABELS,
     fit_base_classifier,
@@ -96,23 +100,13 @@ def run_one(
             score=score,
             method="Marginal CP",
         ))
-    add_timed_result(lambda: relational_jomi_unit_top(
-            cal_probs,
-            split.y_cal,
-            cal_support,
-            test_probs,
-            test_support,
-            selection,
-            config,
-            alpha,
-            score=score,
-        ))
-    add_timed_result(lambda: relational_self_calibrating_cp(
+    add_timed_result(lambda: relational_bonferroni_cp(
             cal_probs,
             split.y_cal,
             test_probs,
             selection,
             alpha,
+            divisor=len(relation_spec.action_names),
             score=score,
         ))
     add_timed_result(lambda: action_wise_cp(
@@ -122,26 +116,6 @@ def run_one(
             selection,
             relation_spec.relation,
             alpha,
-        ))
-    add_timed_result(lambda: relational_oscp_top(
-            cal_probs,
-            split.y_cal,
-            cal_support,
-            test_probs,
-            test_support,
-            selection,
-            config,
-            alpha,
-            score=score,
-        ))
-    add_timed_result(lambda: relational_bonferroni_cp(
-            cal_probs,
-            split.y_cal,
-            test_probs,
-            selection,
-            alpha,
-            divisor=len(relation_spec.action_names),
-            score=score,
         ))
     if n <= 10000:
         add_timed_result(lambda: relational_swap_cp(
@@ -155,6 +129,36 @@ def run_one(
                 alpha,
                 score=score,
             ))
+    add_timed_result(lambda: relational_self_calibrating_cp(
+            cal_probs,
+            split.y_cal,
+            test_probs,
+            selection,
+            alpha,
+            score=score,
+        ))
+    add_timed_result(lambda: relational_jomi_unit_top(
+            cal_probs,
+            split.y_cal,
+            cal_support,
+            test_probs,
+            test_support,
+            selection,
+            config,
+            alpha,
+            score=score,
+        ))
+    add_timed_result(lambda: relational_oscp_top(
+            cal_probs,
+            split.y_cal,
+            cal_support,
+            test_probs,
+            test_support,
+            selection,
+            config,
+            alpha,
+            score=score,
+        ))
 
     rows = []
     for result, time_sec in timed_results:
@@ -228,13 +232,23 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--score", choices=["lac", "aps"], default="lac")
     parser.add_argument("--cuda", type=int, default=0, help="CUDA device index, defaults to 0.")
+    parser.add_argument("--verbose", action="store_true", help="Print per-seed diagnostics and tables.")
     parser.add_argument("--out-dir", type=Path, default=Path("results/relational_synthetic"))
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     runs = []
     diagnostics = []
-    for seed in range(args.seeds):
+    seed_core_cols = [
+        "method",
+        "coverage",
+        "avg_size",
+        "edge_cov",
+        "edge_size",
+        "avg_ref_size",
+        "time_sec",
+    ]
+    for seed in tqdm(range(args.seeds), desc="Seeds", unit="seed"):
         df, diag = run_one(
             seed,
             args.n,
@@ -245,31 +259,35 @@ def main() -> None:
         )
         runs.append(df)
         diagnostics.append(diag)
-        print(f"\nSeed {seed} diagnostics: {diag}")
-        print(table_string(
-            round_for_output(to_percent_table(df)[
-                [
-                    "method",
-                    "coverage",
-                    "avg_size",
-                    "time_sec",
-                    "decision_ambiguity",
-                    "action_union_size",
-                    "edge_cov",
-                    "routine_cov",
-                    "labs_cov",
-                    "imaging_cov",
-                    "urgent_cov",
-                    "expert_review_cov",
-                    "edge_size",
-                    "action_cov_gap",
-                    "worst_under_gap",
-                    "explain_rate",
-                    "routine_critical_miss_rate",
-                    "avg_ref_size",
-                ]
-            ])
-        ))
+        if args.verbose:
+            print(f"\nSeed {seed} diagnostics: {diag}")
+            print(table_string(
+                round_for_output(to_percent_table(df)[
+                    [
+                        "method",
+                        "coverage",
+                        "avg_size",
+                        "time_sec",
+                        "decision_ambiguity",
+                        "action_union_size",
+                        "edge_cov",
+                        "routine_cov",
+                        "labs_cov",
+                        "imaging_cov",
+                        "urgent_cov",
+                        "expert_review_cov",
+                        "edge_size",
+                        "action_cov_gap",
+                        "worst_under_gap",
+                        "explain_rate",
+                        "routine_critical_miss_rate",
+                        "avg_ref_size",
+                    ]
+                ])
+            ))
+        else:
+            print(f"\nSeed {seed} core metrics:")
+            print(table_string(round_for_output(to_percent_table(df)[seed_core_cols])))
 
     raw = pd.concat(
         [df.assign(seed=seed) for seed, df in enumerate(runs)],
