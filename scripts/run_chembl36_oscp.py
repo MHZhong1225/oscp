@@ -72,7 +72,6 @@ def run_one(
     n_targets: int,
     use_existing_split: bool,
     force_rebuild: bool,
-    fingerprint: str,
     n_bits: int,
     radius: int,
     alpha: float,
@@ -93,7 +92,6 @@ def run_one(
     )
     split, resolved_fingerprint = make_chembl_splits(
         data,
-        fingerprint=fingerprint,
         n_bits=n_bits,
         radius=radius,
     )
@@ -131,7 +129,7 @@ def run_one(
         start = time.perf_counter()
         timed_results.append((make_result(), time.perf_counter() - start))
 
-    for make_result in (
+    result_factories = [
         lambda: edge_label_marginal_cp(
             cal_probs=cal_probs,
             cal_labels=split.y_cal,
@@ -149,24 +147,25 @@ def run_one(
         #     alpha=alpha,
         #     divisor=len(data.action_names),
         # ),
-        lambda: edge_label_actionwise_cp(
+        # lambda: edge_label_self_calibrating_cp(
+        #     cal_probs=cal_probs,
+        #     cal_labels=split.y_cal,
+        #     cal_observed=split.observed_cal,
+        #     test_probs=test_probs,
+        #     selection=selection,
+        #     alpha=alpha,
+        # ),
+        lambda: edge_label_jomi_unit_top(
             cal_probs=cal_probs,
             cal_labels=split.y_cal,
             cal_observed=split.observed_cal,
             test_probs=test_probs,
+            test_observed=split.observed_test,
             selection=selection,
             config=config,
             alpha=alpha,
         ),
-        lambda: edge_label_self_calibrating_cp(
-            cal_probs=cal_probs,
-            cal_labels=split.y_cal,
-            cal_observed=split.observed_cal,
-            test_probs=test_probs,
-            selection=selection,
-            alpha=alpha,
-        ),
-        lambda: edge_label_jomi_unit_top(
+        lambda: edge_label_actionwise_cp(
             cal_probs=cal_probs,
             cal_labels=split.y_cal,
             cal_observed=split.observed_cal,
@@ -185,7 +184,9 @@ def run_one(
             config=config,
             alpha=alpha,
         ),
-    ):
+    ]
+
+    for make_result in result_factories:
         add_timed_result(make_result)
 
     rows = []
@@ -259,15 +260,9 @@ def main() -> None:
     parser.add_argument(
         "--use-existing-split",
         action="store_true",
-        help="Reuse split column from chembl_oscp_edges_split.parquet instead of creating seed-specific compound splits.",
+        help="Reuse split column from the matching target-count ChEMBL split parquet instead of creating seed-specific compound splits.",
     )
     parser.add_argument("--n-targets", type=int, default=30)
-    parser.add_argument(
-        "--fingerprint",
-        choices=["auto", "morgan", "hashed_smiles"],
-        default="auto",
-        help="auto uses Morgan when RDKit is installed, otherwise hashed SMILES n-grams.",
-    )
     parser.add_argument("--n-bits", type=int, default=2048)
     parser.add_argument("--radius", type=int, default=2)
     parser.add_argument("--alpha", type=float, default=0.10)
@@ -281,11 +276,10 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    target_cov_cols = [f"target_{a}_cov" for a in range(args.n_targets)]
-    display_cols = [
+    print_cols = [
         "method",
         "coverage",
-        "edge_cov",
+        # "edge_cov",
         "edge_size",
         "avg_ref_size",
         "selected_active_rate",
@@ -298,9 +292,8 @@ def main() -> None:
         "very_hard_edge_cov",
         "threshold_cov_gap",
         "time_sec",
-        "n_edges",
-        "n_compounds",
-        *target_cov_cols,
+        # "n_edges",
+        # "n_compounds",
     ]
     core_cols = [
         "method",
@@ -329,7 +322,6 @@ def main() -> None:
             n_targets=args.n_targets,
             use_existing_split=args.use_existing_split,
             force_rebuild=args.force_rebuild,
-            fingerprint=args.fingerprint,
             n_bits=args.n_bits,
             radius=args.radius,
             alpha=args.alpha,
@@ -344,9 +336,18 @@ def main() -> None:
         target_summaries.append(target_summary.assign(seed=seed))
 
         percent = round_for_output(to_percent_table(df))
-        print(f"\nSeed {seed} diagnostics: {diag}")
         print(
-            percent[existing_cols(percent, display_cols)].to_string(
+            "\n"
+            f"Seed {seed}: "
+            f"targets={diag['n_targets']} "
+            f"edges={diag['n_selected_edges']} "
+            f"compounds={diag['n_selected_compounds']} "
+            f"model={diag['model_type']} "
+            f"device={diag['device']} "
+            f"val_log_loss={diag['mean_val_log_loss']:.4f}"
+        )
+        print(
+            percent[existing_cols(percent, print_cols)].to_string(
                 index=False,
                 float_format=lambda x: f"{x:0.4f}",
             )
@@ -371,7 +372,7 @@ def main() -> None:
 
     print("\nAggregated means:")
     print(
-        display_summary[existing_cols(display_summary, display_cols)].to_string(
+        display_summary[existing_cols(display_summary, print_cols)].to_string(
             index=False,
             float_format=lambda x: f"{x:0.4f}",
         )

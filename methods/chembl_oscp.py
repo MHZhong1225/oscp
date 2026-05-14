@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -13,7 +14,6 @@ import torch
 import torch.nn.functional as F
 
 from scipy import sparse
-from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.metrics import log_loss
 from sklearn.model_selection import train_test_split
 
@@ -106,27 +106,76 @@ class ChemblMultiTaskActivityPredictor:
 def extract_raw_chembl_edges(
     sqlite_path: Path,
     out_path: Path,
+    include_censored_inactive: bool = False,
 ) -> pd.DataFrame:
-    """Extract human single-protein pChEMBL activity edges from ChEMBL SQLite."""
+    """
+    Extract strict ChEMBL36 activity records for human direct single-protein binding tasks.
+
+    Default behavior is the strict exact-only baseline:
+        - Homo sapiens
+        - SINGLE PROTEIN
+        - assay confidence_score = 9
+        - binding assay only: assay_type = 'B'
+        - exact standardized nM measurements only: standard_relation = '='
+        - pchembl_value is not null
+        - standard_type in IC50/Ki/Kd
+        - potential duplicates removed
+        - molecule is mapped to its ChEMBL parent compound before aggregation
+
+    If include_censored_inactive=True, the extractor also keeps censored inactive
+    observations such as IC50 > 10000 nM. These rows are not treated as exact
+    pChEMBL values later; they are used only as binary inactive evidence.
+    """
     import sqlite3
 
-    query = """
+    activity_condition = """
+        (
+            -- strict exact pChEMBL records
+            act.pchembl_value IS NOT NULL
+            AND act.standard_relation = '='
+        )
+    """
+    if include_censored_inactive:
+        activity_condition = """
+        (
+            (
+                -- strict exact pChEMBL records
+                act.pchembl_value IS NOT NULL
+                AND act.standard_relation = '='
+            )
+            OR
+            (
+                -- censored inactive records, e.g. IC50 > 10000 nM
+                act.standard_relation IN ('>', '>=')
+                AND act.standard_value >= 10000
+            )
+        )
+        """
+
+    query = f"""
     SELECT
-        md.chembl_id AS compound_chembl_id,
-        cs.canonical_smiles AS canonical_smiles,
+        COALESCE(pmd.chembl_id, md.chembl_id) AS compound_chembl_id,
+        COALESCE(pcs.canonical_smiles, cs.canonical_smiles) AS canonical_smiles,
+        md.chembl_id AS original_compound_chembl_id,
+        cs.canonical_smiles AS original_canonical_smiles,
+
         td.chembl_id AS target_chembl_id,
         td.pref_name AS target_name,
         td.target_type AS target_type,
         td.organism AS organism,
+
         a.chembl_id AS assay_chembl_id,
         a.assay_type AS assay_type,
         a.confidence_score AS confidence_score,
+
         act.standard_type AS standard_type,
         act.standard_relation AS standard_relation,
         act.standard_value AS standard_value,
         act.standard_units AS standard_units,
         act.pchembl_value AS pchembl_value,
-        act.data_validity_comment AS data_validity_comment
+        act.data_validity_comment AS data_validity_comment,
+        act.potential_duplicate AS potential_duplicate
+
     FROM activities act
     JOIN assays a
         ON act.assay_id = a.assay_id
@@ -136,20 +185,45 @@ def extract_raw_chembl_edges(
         ON act.molregno = md.molregno
     JOIN compound_structures cs
         ON md.molregno = cs.molregno
+
+    -- Map salts / alternative forms to the ChEMBL parent compound.
+    LEFT JOIN molecule_hierarchy mh
+        ON md.molregno = mh.molregno
+    LEFT JOIN molecule_dictionary pmd
+        ON COALESCE(mh.parent_molregno, md.molregno) = pmd.molregno
+    LEFT JOIN compound_structures pcs
+        ON COALESCE(mh.parent_molregno, md.molregno) = pcs.molregno
+
     WHERE
-        act.pchembl_value IS NOT NULL
-        AND cs.canonical_smiles IS NOT NULL
+        COALESCE(pcs.canonical_smiles, cs.canonical_smiles) IS NOT NULL
+
+        -- Human direct single-protein targets only.
         AND td.organism = 'Homo sapiens'
         AND td.target_type = 'SINGLE PROTEIN'
-        AND a.confidence_score >= 8
-        AND act.standard_relation = '='
+        AND a.confidence_score = 9
+
+        -- Binding assays only. This avoids mixing binding and functional endpoints.
+        AND a.assay_type = 'B'
+        -- Standardized nM activity records.
+        AND act.standard_units = 'nM'
+        AND act.standard_value > 0
+        AND act.standard_type IN ('IC50', 'Ki', 'Kd')
+        -- Remove suspicious or duplicated records.
         AND (
             act.data_validity_comment IS NULL
             OR act.data_validity_comment = 'Manually validated'
         )
+        AND (
+            act.potential_duplicate IS NULL
+            OR act.potential_duplicate = 0
+        )
+
+        AND {activity_condition}
     """
+
     with sqlite3.connect(sqlite_path) as conn:
         raw = pd.read_sql_query(query, conn)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     raw.to_parquet(out_path, index=False)
     return raw
@@ -160,29 +234,174 @@ def aggregate_compound_target_edges(
     out_path: Path | None = None,
     active_threshold: float = 6.0,
     inactive_threshold: float = 5.0,
-    max_iqr: float = 1.5,
+    max_pchembl_range: float = 1.5,
+    drop_gray_exact_pairs: bool = True,
 ) -> pd.DataFrame:
-    """Aggregate repeated ChEMBL measurements into one binary compound-target edge."""
+    """
+    Aggregate repeated ChEMBL records into one binary parent-compound/target edge.
+
+    Exact pChEMBL records are aggregated by median pChEMBL:
+        - median pChEMBL >= active_threshold   -> active, y = 1
+        - median pChEMBL <= inactive_threshold -> inactive, y = 0
+        - inactive_threshold < median < active_threshold -> gray zone, dropped by default
+
+    Optional censored inactive rows, if present in raw, are handled only as binary
+    inactive evidence:
+        - standard_relation in {'>', '>='} and standard_value >= 10000 nM -> y = 0 evidence
+
+    Censored rows are never included in pChEMBL median/range calculations.
+    Compound-target pairs with conflicting active and inactive evidence are dropped.
+    """
     raw = raw.copy()
-    raw["pchembl_value"] = pd.to_numeric(raw["pchembl_value"], errors="coerce")
-    raw = raw.dropna(subset=["compound_chembl_id", "canonical_smiles", "target_chembl_id", "pchembl_value"])
-    agg = (
-        raw.groupby(
-            ["compound_chembl_id", "canonical_smiles", "target_chembl_id", "target_name"],
-            as_index=False,
+    raw["pchembl_value"] = pd.to_numeric(raw.get("pchembl_value"), errors="coerce")
+    raw["standard_value"] = pd.to_numeric(raw.get("standard_value"), errors="coerce")
+
+    required = [
+        "compound_chembl_id",
+        "canonical_smiles",
+        "target_chembl_id",
+        "target_name",
+        "standard_relation",
+        "standard_value",
+        "standard_units",
+    ]
+    raw = raw.dropna(subset=required).copy()
+
+    group_cols = [
+        "compound_chembl_id",
+        "canonical_smiles",
+        "target_chembl_id",
+        "target_name",
+    ]
+
+    exact = raw[
+        raw["standard_relation"].eq("=")
+        & raw["pchembl_value"].notna()
+    ].copy()
+
+    censored_inactive = raw[
+        raw["standard_relation"].isin([">", ">="])
+        & raw["standard_units"].eq("nM")
+        & raw["standard_value"].ge(10000.0)
+    ].copy()
+
+    # Aggregate exact pChEMBL records.
+    if exact.empty:
+        exact_agg = pd.DataFrame(columns=group_cols)
+    else:
+        exact_agg = (
+            exact.groupby(group_cols, as_index=False)
+            .agg(
+                pchembl_median=("pchembl_value", "median"),
+                pchembl_min=("pchembl_value", "min"),
+                pchembl_max=("pchembl_value", "max"),
+                n_exact_measurements=("pchembl_value", "size"),
+                assay_types=("assay_type", lambda x: ",".join(sorted(set(map(str, x))))),
+                standard_types=("standard_type", lambda x: ",".join(sorted(set(map(str, x))))),
+            )
         )
-        .agg(
-            pchembl_median=("pchembl_value", "median"),
-            pchembl_iqr=("pchembl_value", lambda x: np.quantile(x, 0.75) - np.quantile(x, 0.25)),
-            n_measurements=("pchembl_value", "size"),
+        exact_agg["pchembl_range"] = exact_agg["pchembl_max"] - exact_agg["pchembl_min"]
+        exact_agg["exact_y"] = np.nan
+        exact_agg.loc[exact_agg["pchembl_median"].ge(active_threshold), "exact_y"] = 1
+        exact_agg.loc[exact_agg["pchembl_median"].le(inactive_threshold), "exact_y"] = 0
+        exact_agg["exact_is_gray"] = exact_agg["exact_y"].isna()
+
+        # Remove exact pairs with large experimental disagreement.
+        exact_agg = exact_agg[
+            (exact_agg["n_exact_measurements"] <= 1)
+            | exact_agg["pchembl_range"].le(max_pchembl_range)
+        ].copy()
+
+    # Aggregate censored inactive evidence separately.
+    if censored_inactive.empty:
+        censored_agg = pd.DataFrame(columns=group_cols + ["n_censored_inactive"])
+    else:
+        censored_agg = (
+            censored_inactive.groupby(group_cols, as_index=False)
+            .agg(n_censored_inactive=("standard_value", "size"))
         )
-    )
-    agg = agg[agg["pchembl_iqr"] <= max_iqr].copy()
-    agg["y"] = np.nan
-    agg.loc[agg["pchembl_median"] >= active_threshold, "y"] = 1
-    agg.loc[agg["pchembl_median"] <= inactive_threshold, "y"] = 0
+
+    # Outer-merge exact and censored evidence so censored-only inactive pairs can be kept.
+    agg = exact_agg.merge(censored_agg, on=group_cols, how="outer")
+    if agg.empty:
+        if out_path is not None:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            agg.to_parquet(out_path, index=False)
+        return agg
+
+    if "n_exact_measurements" not in agg.columns:
+        agg["n_exact_measurements"] = 0
+    else:
+        agg["n_exact_measurements"] = pd.to_numeric(
+            agg["n_exact_measurements"],
+            errors="coerce",
+        ).fillna(0).astype(int)
+
+    if "n_censored_inactive" not in agg.columns:
+        agg["n_censored_inactive"] = 0
+    else:
+        agg["n_censored_inactive"] = pd.to_numeric(
+            agg["n_censored_inactive"],
+            errors="coerce",
+        ).fillna(0).astype(int)
+
+    if "exact_is_gray" not in agg.columns:
+        agg["exact_is_gray"] = False
+    else:
+        agg["exact_is_gray"] = agg["exact_is_gray"].fillna(False).astype(bool)
+
+    if "exact_y" not in agg.columns:
+        agg["exact_y"] = np.nan
+
+    agg["has_censored_inactive"] = agg["n_censored_inactive"].gt(0)
+
+    # Start with exact labels, then add censored-only inactive labels.
+    agg["y"] = agg["exact_y"]
+    censored_only = agg["y"].isna() & agg["has_censored_inactive"] & ~agg["exact_is_gray"]
+    agg.loc[censored_only, "y"] = 0
+
+    # Drop gray exact pairs by default, even if they also have censored inactive evidence.
+    if drop_gray_exact_pairs:
+        agg = agg[~agg["exact_is_gray"]].copy()
+
+    # Drop conflicts: exact active together with censored inactive evidence.
+    conflict = agg["exact_y"].eq(1) & agg["has_censored_inactive"]
+    agg = agg[~conflict].copy()
+
+    # Drop unlabeled rows.
     agg = agg.dropna(subset=["y"]).copy()
     agg["y"] = agg["y"].astype(int)
+
+    agg["evidence_source"] = "exact"
+    agg.loc[
+        agg["n_exact_measurements"].eq(0) & agg["has_censored_inactive"],
+        "evidence_source",
+    ] = "censored_inactive_only"
+    agg.loc[
+        agg["n_exact_measurements"].gt(0) & agg["has_censored_inactive"],
+        "evidence_source",
+    ] = "exact_plus_censored_inactive"
+
+    # Keep stable column order for downstream code and analysis.
+    preferred_cols = [
+        "compound_chembl_id",
+        "canonical_smiles",
+        "target_chembl_id",
+        "target_name",
+        "y",
+        "pchembl_median",
+        "pchembl_min",
+        "pchembl_max",
+        "pchembl_range",
+        "n_exact_measurements",
+        "n_censored_inactive",
+        "evidence_source",
+        "assay_types",
+        "standard_types",
+    ]
+    remaining_cols = [c for c in agg.columns if c not in preferred_cols]
+    agg = agg[[c for c in preferred_cols if c in agg.columns] + remaining_cols]
+
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         agg.to_parquet(out_path, index=False)
@@ -241,17 +460,24 @@ def prepare_chembl36_processed_files(
     sqlite_path: Path | None = None,
     n_targets: int = 30,
     force: bool = False,
+    include_censored_inactive: bool = False,
 ) -> Path:
     """Create raw, aggregated, and selected-target parquet files if needed."""
     data_root.mkdir(parents=True, exist_ok=True)
-    raw_path = data_root / "raw_human_single_protein.parquet"
-    compound_target_path = data_root / "compound_target_edges.parquet"
-    selected_path = data_root / "chembl_oscp_edges.parquet"
+
+    suffix = "exact_plus_censored_inactive" if include_censored_inactive else "exact"
+    raw_path = data_root / f"raw_human_direct_single_protein_binding_{suffix}.parquet"
+    compound_target_path = data_root / f"compound_target_edges_{suffix}.parquet"
+    selected_path = data_root / f"chembl_oscp_edges_{suffix}_top{n_targets}.parquet"
 
     if force or not raw_path.exists():
         if sqlite_path is None:
             sqlite_path = data_root / "chembl_36" / "chembl_36_sqlite" / "chembl_36.db"
-        extract_raw_chembl_edges(sqlite_path, raw_path)
+        extract_raw_chembl_edges(
+            sqlite_path=sqlite_path,
+            out_path=raw_path,
+            include_censored_inactive=include_censored_inactive,
+        )
 
     if force or not compound_target_path.exists():
         raw = pd.read_parquet(raw_path)
@@ -302,17 +528,23 @@ def load_chembl36_data(
     seed: int = 0,
     force_rebuild: bool = False,
     sqlite_path: Path | None = None,
+    include_censored_inactive: bool = False,
 ) -> ChemblData:
     """Load selected ChEMBL target-screening edges and compound split metadata."""
     if edges_path is None:
-        split_path = data_root / "chembl_oscp_edges_split.parquet"
+        suffix = "exact_plus_censored_inactive" if include_censored_inactive else "exact"
         selected_path = prepare_chembl36_processed_files(
             data_root=data_root,
             sqlite_path=sqlite_path,
             n_targets=n_targets,
             force=force_rebuild,
+            include_censored_inactive=include_censored_inactive,
         )
-        edges_path = split_path if use_existing_split and split_path.exists() and not force_rebuild else selected_path
+        split_path = data_root / f"chembl_oscp_edges_{suffix}_top{n_targets}_split.parquet"
+        if use_existing_split and split_path.exists() and not force_rebuild:
+            edges_path = split_path
+        else:
+            edges_path = selected_path
 
     edges = pd.read_parquet(edges_path).copy()
     if n_targets is not None and edges["target_chembl_id"].nunique() > n_targets:
@@ -361,19 +593,17 @@ def _morgan_fingerprint_matrix(
     n_bits: int,
     radius: int,
 ) -> sparse.csr_matrix:
-    try:
-        from rdkit import Chem
-        from rdkit.Chem import AllChem
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("RDKit is required for Morgan fingerprints.") from exc
+    from rdkit import Chem
+    from rdkit.Chem import rdFingerprintGenerator
 
+    generator = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=n_bits)
     rows: list[int] = []
     cols: list[int] = []
     for i, smi in enumerate(smiles):
         mol = Chem.MolFromSmiles(str(smi))
         if mol is None:
             continue
-        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+        fp = generator.GetFingerprint(mol)
         on_bits = list(fp.GetOnBits())
         rows.extend([i] * len(on_bits))
         cols.extend(on_bits)
@@ -381,22 +611,29 @@ def _morgan_fingerprint_matrix(
     return sparse.csr_matrix((data, (rows, cols)), shape=(len(smiles), n_bits), dtype=np.float32)
 
 
-def _hashed_smiles_matrix(
-    smiles: Sequence[str],
-    n_bits: int,
-    ngram_min: int = 2,
-    ngram_max: int = 5,
-) -> sparse.csr_matrix:
-    vectorizer = HashingVectorizer(
-        analyzer="char",
-        ngram_range=(ngram_min, ngram_max),
-        n_features=n_bits,
-        alternate_sign=False,
-        norm=None,
-        binary=True,
-        dtype=np.float32,
+def _compound_feature_cache_digest(compounds: pd.DataFrame) -> str:
+    """Stable short digest so feature caches cannot collide across different datasets."""
+    key_cols = ["compound_chembl_id", "canonical_smiles"]
+    payload = (
+        compounds[key_cols]
+        .fillna("")
+        .astype(str)
+        .sort_values(key_cols)
+        .to_csv(index=False)
+        .encode("utf-8")
     )
-    return vectorizer.transform([str(s) for s in smiles]).tocsr()
+    return hashlib.sha1(payload).hexdigest()[:12]
+
+
+def _compound_feature_cache_path(
+    cache_digest: str,
+    n_rows: int,
+    n_bits: int,
+    radius: int,
+) -> Path:
+    return CHEMBL_FEATURE_CACHE_DIR / (
+        f"morgan_{cache_digest}_n{n_rows}_bits{n_bits}_r{radius}.npz"
+    )
 
 
 def build_compound_features(
@@ -407,30 +644,22 @@ def build_compound_features(
 ) -> tuple[sparse.csr_matrix, str]:
     """Build compound features. auto uses Morgan when RDKit is installed."""
     smiles = compounds["canonical_smiles"].fillna("").astype(str).tolist()
-    if fingerprint not in {"auto", "morgan", "hashed_smiles"}:
+    cache_digest = _compound_feature_cache_digest(compounds)
+    if fingerprint not in {"auto", "morgan"}:
         raise ValueError(f"unknown fingerprint: {fingerprint}")
 
-    if fingerprint in {"auto", "morgan"}:
-        try:
-            cache_path = CHEMBL_FEATURE_CACHE_DIR / (
-                f"morgan_n{len(smiles)}_bits{n_bits}_r{radius}.npz"
-            )
-            if cache_path.exists():
-                return sparse.load_npz(cache_path).tocsr(), "morgan"
-            features = _morgan_fingerprint_matrix(smiles, n_bits=n_bits, radius=radius)
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            sparse.save_npz(cache_path, features)
-            return features, "morgan"
-        except RuntimeError:
-            if fingerprint == "morgan":
-                raise
-    cache_path = CHEMBL_FEATURE_CACHE_DIR / f"hashed_smiles_n{len(smiles)}_bits{n_bits}.npz"
+    cache_path = _compound_feature_cache_path(
+        cache_digest,
+        len(smiles),
+        n_bits,
+        radius,
+    )
     if cache_path.exists():
-        return sparse.load_npz(cache_path).tocsr(), "hashed_smiles"
-    features = _hashed_smiles_matrix(smiles, n_bits=n_bits)
+        return sparse.load_npz(cache_path).tocsr(), "morgan"
+    features = _morgan_fingerprint_matrix(smiles, n_bits=n_bits, radius=radius)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     sparse.save_npz(cache_path, features)
-    return features, "hashed_smiles"
+    return features, "morgan"
 
 
 def _label_matrix(
@@ -539,8 +768,8 @@ def _evaluate_masked_val_loss(
     if rows.size == 0:
         return np.nan
     model.eval()
-    losses = []
-    weights = []
+    total_loss = 0.0
+    total_weight = 0
     with torch.no_grad():
         for start in range(0, rows.size, batch_size):
             batch = rows[start : start + batch_size]
@@ -551,11 +780,12 @@ def _evaluate_masked_val_loss(
             y_tensor = torch.as_tensor(y_batch, dtype=torch.float32, device=device)
             mask_tensor = torch.as_tensor(mask_batch, dtype=torch.bool, device=device)
             n_obs = int(mask_batch.sum())
-            losses.append(
-                float(_masked_bce_with_logits(model(x_tensor), y_tensor, mask_tensor).item())
+            batch_loss = float(
+                _masked_bce_with_logits(model(x_tensor), y_tensor, mask_tensor).item()
             )
-            weights.append(n_obs)
-    return float(np.average(losses, weights=weights))
+            total_loss += batch_loss * n_obs
+            total_weight += n_obs
+    return float(total_loss / max(total_weight, 1))
 
 
 def fit_chembl_multitask_model(
@@ -896,10 +1126,11 @@ def edge_label_jomi_unit_top(
     cal_labels: np.ndarray,
     cal_observed: np.ndarray,
     test_probs: np.ndarray,
+    test_observed: np.ndarray,
     selection: EdgeSelection,
     config: RelationalSelectionConfig,
     alpha: float,
-    method: str = "JOMI",
+    method: str = "JOMI-unit",
 ) -> EdgeSetResult:
     cal_scores_matrix = np.full(cal_probs.shape, np.nan, dtype=float)
     cal_scores_matrix[cal_observed] = _observed_binary_scores(
@@ -928,12 +1159,17 @@ def edge_label_jomi_unit_top(
             for action_index, capacity in enumerate(config.capacities):
                 if capacity <= 0:
                     continue
-                candidate_units = reference_mask_top_capacity(
-                    cal_probs[:, action_index],
-                    test_probs[batch, action_index],
-                    local_index,
-                    int(capacity),
-                )
+                valid_local = np.where(test_observed[batch, action_index])[0]
+                valid_local = valid_local[valid_local != local_index]
+                other_scores = test_probs[batch[valid_local], action_index]
+                if other_scores.size < int(capacity):
+                    selection_threshold = -np.inf
+                else:
+                    selection_threshold = np.partition(
+                        other_scores,
+                        other_scores.size - int(capacity),
+                    )[other_scores.size - int(capacity)]
+                candidate_units = cal_probs[:, action_index] >= selection_threshold
                 reference_mask[:, action_index] = (
                     cal_observed[:, action_index] & candidate_units
                 )
@@ -1083,4 +1319,5 @@ def aggregate_runs(runs: list[pd.DataFrame]) -> pd.DataFrame:
     numeric = all_rows.select_dtypes(include=[np.number]).columns.drop("seed")
     means = all_rows.groupby("method", sort=False)[numeric].mean()
     stds = all_rows.groupby("method", sort=False)[numeric].std(ddof=1).add_suffix("_std")
-    return means.join(stds).reset_index()
+    summary = pd.concat([means, stds], axis=1)
+    return summary.reset_index()
